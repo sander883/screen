@@ -21,9 +21,18 @@ import logging
 import time
 from typing import Callable, Awaitable
 
+import httpx
 import websockets
 
 logger = logging.getLogger(__name__)
+
+# Header agar tidak diblokir Cloudflare
+_DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
 
 # Cache mint yang sudah di-screen dalam 10 menit terakhir (anti-duplicate)
 _screened_cache: dict[str, float] = {}
@@ -153,27 +162,22 @@ class PairDetector:
         Ambil mint address dari transaksi pump.fun Create.
 
         Strategi:
-        1. Coba via Helius enhanced transactions (paling akurat)
-        2. Fallback: fetch raw transaction dan baca account keys
+        1. Helius enhanced transactions (paling akurat untuk parsed data)
+        2. Fallback: raw RPC getTransaction dan ekstrak dari instruction accounts
 
         Di pump.fun Create instruction, mint ada di account index 1.
         """
-        import httpx
-
-        # Strategi 1: Helius enhanced transactions
         if self.helius_api_key:
             mint = await self._extract_mint_helius(signature)
             if mint:
                 return mint
-
-        # Strategi 2: Raw RPC getTransaction
         return await self._extract_mint_rpc(signature)
 
     async def _extract_mint_helius(self, signature: str) -> str | None:
         """Extract mint dari Helius parsed transaction."""
         url = "https://api.helius.xyz/v0/transactions"
         try:
-            async with httpx.AsyncClient(timeout=8.0) as http:
+            async with httpx.AsyncClient(timeout=8.0, headers=_DEFAULT_HEADERS) as http:
                 r = await http.post(
                     url,
                     params={"api-key": self.helius_api_key},
@@ -196,16 +200,25 @@ class PairDetector:
                 # Fallback: cek tokenTransfers
                 transfers = tx.get("tokenTransfers", [])
                 if transfers:
-                    return transfers[0].get("mint")
+                    mint = transfers[0].get("mint")
+                    if mint:
+                        return mint
+
+                # Fallback terakhir: ambil dari accountData
+                for acc in tx.get("accountData", []):
+                    for change in acc.get("tokenBalanceChanges", []):
+                        if change.get("mint"):
+                            return change["mint"]
 
         except Exception as e:
             logger.debug(f"Helius mint extract failed: {e}")
         return None
 
     async def _extract_mint_rpc(self, signature: str) -> str | None:
-        """Extract mint dari raw Solana RPC transaction."""
-        import httpx
-
+        """
+        Extract mint dari raw Solana RPC transaction.
+        Handle baik legacy maupun versioned (v0) transactions.
+        """
         rpc_url = (
             f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
             if self.helius_api_key
@@ -222,7 +235,7 @@ class PairDetector:
             ],
         }
         try:
-            async with httpx.AsyncClient(timeout=8.0) as http:
+            async with httpx.AsyncClient(timeout=8.0, headers=_DEFAULT_HEADERS) as http:
                 r = await http.post(rpc_url, json=payload)
                 if r.status_code != 200:
                     return None
@@ -230,14 +243,30 @@ class PairDetector:
                 if not data:
                     return None
 
-                account_keys = (
-                    data.get("transaction", {})
-                    .get("message", {})
-                    .get("accountKeys", [])
-                )
-                # Di pump.fun Create, mint biasanya di index 1
-                if len(account_keys) >= 2:
-                    return account_keys[1]
+                # Handle versioned transaction: loadedAddresses + staticAccountKeys
+                tx_msg = data.get("transaction", {}).get("message", {})
+                account_keys = tx_msg.get("accountKeys", [])
+
+                # Cari instruction untuk pump.fun
+                instructions = tx_msg.get("instructions", [])
+                for ix in instructions:
+                    program_idx = ix.get("programIdIndex")
+                    if program_idx is None or program_idx >= len(account_keys):
+                        continue
+                    if account_keys[program_idx] == self.pumpfun_program:
+                        account_indices = ix.get("accounts", [])
+                        # Di pump.fun Create, mint ada di account index 1 dari instruction
+                        if len(account_indices) >= 2:
+                            mint_idx = account_indices[1]
+                            if mint_idx < len(account_keys):
+                                return account_keys[mint_idx]
+
+                # Fallback: cek postTokenBalances → ambil mint pertama
+                meta = data.get("meta", {}) or {}
+                post_balances = meta.get("postTokenBalances", [])
+                if post_balances:
+                    return post_balances[0].get("mint")
+
         except Exception as e:
             logger.debug(f"RPC mint extract failed: {e}")
         return None

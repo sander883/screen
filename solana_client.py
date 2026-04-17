@@ -22,6 +22,17 @@ _FREEZE_AUTH_OPT   = 46   # u32: 1=Some, 0=None
 _FREEZE_AUTH_OFF   = 50   # Pubkey (32 bytes)
 _MINT_ACCOUNT_SIZE = 82
 
+# Wrapped SOL mint (dipakai untuk fetch SOL/USD price)
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+# Header agar tidak diblokir Cloudflare
+_DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
 
 class SolanaClient:
     """Async client untuk Solana RPC dan API eksternal."""
@@ -29,7 +40,8 @@ class SolanaClient:
     def __init__(self, rpc_url: str, helius_api_key: str = "", timeout: float = 10.0):
         self.rpc_url = rpc_url
         self.helius_api_key = helius_api_key
-        self._http = httpx.AsyncClient(timeout=timeout)
+        self._http = httpx.AsyncClient(timeout=timeout, headers=_DEFAULT_HEADERS)
+        self._sol_price_cache: tuple[float, float] | None = None  # (price, timestamp)
 
     async def close(self):
         await self._http.aclose()
@@ -120,6 +132,60 @@ class SolanaClient:
         result = await self._rpc("getTokenAccountBalance", [token_account])
         return int((result or {}).get("value", {}).get("amount", 0))
 
+    async def get_token_account_owner(self, token_account: str) -> str | None:
+        """
+        Ambil owner address dari token account via jsonParsed encoding.
+        Dipakai untuk map token_account → real wallet owner.
+        """
+        result = await self._rpc(
+            "getAccountInfo",
+            [token_account, {"encoding": "jsonParsed"}],
+        )
+        if not result or not result.get("value"):
+            return None
+        try:
+            return (
+                result["value"]
+                .get("data", {})
+                .get("parsed", {})
+                .get("info", {})
+                .get("owner")
+            )
+        except Exception:
+            return None
+
+    async def get_multiple_token_account_owners(
+        self, token_accounts: list[str]
+    ) -> list[str | None]:
+        """Batch fetch owner addresses (1 RPC call)."""
+        if not token_accounts:
+            return []
+        result = await self._rpc(
+            "getMultipleAccounts",
+            [token_accounts, {"encoding": "jsonParsed"}],
+        )
+        if not result:
+            return [None] * len(token_accounts)
+        owners = []
+        for acc in (result.get("value") or []):
+            if not acc:
+                owners.append(None)
+                continue
+            try:
+                owner = (
+                    acc.get("data", {})
+                    .get("parsed", {})
+                    .get("info", {})
+                    .get("owner")
+                )
+                owners.append(owner)
+            except Exception:
+                owners.append(None)
+        # Pad jika hasil kurang dari input
+        while len(owners) < len(token_accounts):
+            owners.append(None)
+        return owners
+
     # ── Helius Enhanced Transactions ───────────────────────────────────────
 
     async def get_parsed_transactions(self, signatures: list[str]) -> list[dict]:
@@ -197,6 +263,32 @@ class SolanaClient:
             if attempt < retries - 1:
                 await asyncio.sleep(delay)
         return {}
+
+    async def get_sol_price_usd(self) -> float:
+        """
+        Ambil harga SOL USD dari DexScreener (cached 60 detik).
+        Fallback ke $150 jika gagal.
+        """
+        import time
+        FALLBACK = 150.0
+        CACHE_TTL = 60.0
+
+        if self._sol_price_cache:
+            price, ts = self._sol_price_cache
+            if time.time() - ts < CACHE_TTL:
+                return price
+
+        data = await self.get_dexscreener_data(WSOL_MINT)
+        try:
+            price = float(data.get("priceUsd") or 0)
+            if price > 0:
+                self._sol_price_cache = (price, time.time())
+                return price
+        except Exception:
+            pass
+
+        logger.warning(f"Cannot fetch SOL price, using fallback ${FALLBACK}")
+        return FALLBACK
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────

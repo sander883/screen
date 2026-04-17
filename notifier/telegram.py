@@ -12,7 +12,12 @@ Format notifikasi dirancang untuk scalp cepat:
 """
 
 import logging
+from typing import TYPE_CHECKING
+
 import httpx
+
+if TYPE_CHECKING:
+    from solana_screener import SolanaTokenResult
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +53,7 @@ async def send_alert(token_result: "SolanaTokenResult", bot_token: str, chat_id:
         return False
 
 
-def _format_message(r: "SolanaTokenResult") -> str:
+def _format_message(r) -> str:
     """
     Format pesan Telegram dengan info lengkap untuk keputusan scalp cepat.
     Menggunakan HTML formatting.
@@ -142,39 +147,3 @@ def _format_age(seconds: float) -> str:
     if seconds < 3600:
         return f"{int(seconds/60)}m {int(seconds%60)}s"
     return f"{int(seconds/3600)}h {int((seconds%3600)/60)}m"
-
-
-# Type stub — hindari circular import
-class SolanaTokenResult:
-    mint: str
-    symbol: str
-    name: str
-    pair_age_seconds: float
-    decision: str
-    total_flags: int
-    flag_reasons: list[str]
-    # Filter 0
-    safety_flag: bool
-    mint_authority_revoked: bool
-    freeze_authority_revoked: bool
-    # Filter 1
-    network_flag: bool
-    priority_fee_microlamports: int
-    # Filter 2
-    wallet_flag: bool
-    holder_count: int
-    fresh_wallet_count: int
-    fresh_wallet_ratio: float
-    # Filter 3
-    holder_flag: bool
-    top1_holder_pct: float
-    top10_combined_pct: float
-    lp_burned: bool
-    # Filter 4
-    entry_flag: bool
-    market_cap_usd: float
-    liquidity_usd: float
-    liquidity_sol_est: float
-    volume_5m_usd: float
-    mcap_tier: str
-    dex_pair_url: str

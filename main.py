@@ -61,23 +61,30 @@ async def live_mode():
     logger.info("=" * 55)
     logger.info("Listening untuk new pairs... (Ctrl+C untuk stop)")
 
-    # Graceful shutdown
-    loop = asyncio.get_event_loop()
+    # Graceful shutdown via asyncio signal handlers
+    loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
-    def _shutdown(sig, frame):
-        logger.info(f"Shutdown signal ({sig.name}) received")
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            # Windows tidak support add_signal_handler
+            signal.signal(sig, lambda *_: stop_event.set())
 
     detect_task = asyncio.create_task(detector.start())
-    await stop_event.wait()
-    await detector.stop()
-    detect_task.cancel()
-    await screener.close()
-    logger.info("Bot stopped.")
+    try:
+        await stop_event.wait()
+    finally:
+        logger.info("Shutting down...")
+        await detector.stop()
+        detect_task.cancel()
+        try:
+            await detect_task
+        except asyncio.CancelledError:
+            pass
+        await screener.close()
+        logger.info("Bot stopped.")
 
 
 async def scan_mode(mint: str):
@@ -104,6 +111,13 @@ async def test_mode():
     """
     import httpx
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+
     print("\n── Test Konfigurasi ────────────────────────────")
 
     # Test Helius
@@ -112,7 +126,7 @@ async def test_mode():
         url = Config.rpc_url()
         payload = {"jsonrpc": "2.0", "id": 1, "method": "getHealth", "params": []}
         try:
-            async with httpx.AsyncClient(timeout=8.0) as http:
+            async with httpx.AsyncClient(timeout=8.0, headers=headers) as http:
                 r = await http.post(url, json=payload)
                 result = r.json().get("result", "unknown")
                 status = "OK" if result == "ok" else f"Response: {result}"
@@ -126,14 +140,15 @@ async def test_mode():
     # Test DexScreener
     print("\n[2] DexScreener API (no key required)")
     try:
-        # Test dengan token SOL yang pasti ada
-        async with httpx.AsyncClient(timeout=8.0) as http:
+        async with httpx.AsyncClient(timeout=8.0, headers=headers) as http:
             r = await http.get(
                 "https://api.dexscreener.com/latest/dex/tokens/"
                 "So11111111111111111111111111111111111111112"
             )
             if r.status_code == 200:
-                print("    DexScreener: OK")
+                data = r.json()
+                pairs = data.get("pairs") or []
+                print(f"    DexScreener: OK ({len(pairs)} pairs found for WSOL)")
             else:
                 print(f"    DexScreener: {r.status_code}")
     except Exception as e:
@@ -144,7 +159,7 @@ async def test_mode():
     print(f"    Telegram Chat ID  : {'SET' if Config.TELEGRAM_CHAT_ID else 'MISSING'}")
     if Config.TELEGRAM_BOT_TOKEN:
         try:
-            async with httpx.AsyncClient(timeout=8.0) as http:
+            async with httpx.AsyncClient(timeout=8.0, headers=headers) as http:
                 r = await http.get(
                     f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/getMe"
                 )

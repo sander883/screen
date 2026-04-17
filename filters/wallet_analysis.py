@@ -1,31 +1,28 @@
 """
 Filter 2: Wallet Analysis
 ──────────────────────────
-Ini filter PALING PENTING untuk kualitas screening.
-Mendeteksi bundled buy dan pola wallet koordinasi (cabal).
-
-Bundled buy: banyak wallet baru membeli di transaksi awal secara koordinasi.
-Signal rug pull paling kuat di Solana meme coins.
+Filter PALING PENTING untuk kualitas screening.
+Menganalisis pola wallet dari actual token holders (bukan sekedar fee payers).
 
 Logika:
-1. Ambil 10 transaksi pertama token mint
-2. Ekstrak unique buyer wallets
-3. Untuk tiap buyer, cek berapa total tx riwayat wallet
-4. Jika banyak buyer adalah "fresh wallets" (< 10 tx total) → bundle flag
-5. Jika ratio fresh wallets terlalu tinggi → flag
+1. Ambil top 15 token holders via getTokenLargestAccounts
+2. Map token account → owner wallet address (batch RPC call)
+3. Untuk setiap owner, cek jumlah tx history (proxy untuk wallet age)
+4. Wallet dengan < N tx = "fresh wallet"
+5. Jika ratio fresh wallets terlalu tinggi → bundle/cabal flag
+
+Pendekatan ini jauh lebih akurat dari membaca fee payer karena:
+- Fee payer di pump.fun create = dev, bukan buyer
+- Token largest accounts = actual holders saat ini
+- Bundle/cabal langsung ketahuan dari pattern usia wallet holder
 """
 
 import asyncio
 import logging
-import time
 from solana_client import SolanaClient
 from config import Config
 
 logger = logging.getLogger(__name__)
-
-# Waktu "dianggap fresh" dalam hari
-_FRESH_WALLET_DAYS = 7
-_SOL_GENESIS_TIMESTAMP = 1584332400  # March 2020 approx
 
 
 async def check(
@@ -35,47 +32,56 @@ async def check(
 ) -> tuple[bool, dict]:
     """
     Returns (flag, details).
-    flag=True → pola wallet mencurigakan (potensi bundle/rug).
+    flag=True → pola wallet mencurigakan (bundle/cabal).
     """
     try:
-        # Ambil transaksi awal token ini
-        sigs = await client.get_signatures_for_address(mint, limit=20)
-        if not sigs:
-            return True, {"error": "No transactions found", "holder_count": 0}
-
-        # Ekstrak buyer wallets dari transaksi
-        buyers = await _extract_buyers(mint, sigs[:10], client)
-        holder_count = len(buyers)
+        # 1. Ambil top token holders (token accounts)
+        holders = await client.get_token_largest_accounts(mint)
+        holder_count = len(holders)
 
         if holder_count < config.MIN_HOLDER_COUNT:
             return True, {
                 "holder_count": holder_count,
                 "min_required": config.MIN_HOLDER_COUNT,
-                "reason": "Too few holders",
+                "reasons": [f"Hanya {holder_count} holders (min {config.MIN_HOLDER_COUNT})"],
             }
 
-        # Cek berapa wallet yang "fresh" (baru dibuat)
-        wallet_ages = await _check_wallet_ages(buyers[:15], client)
-        fresh_count = sum(1 for age in wallet_ages if age < config.FRESH_WALLET_TX_THRESHOLD)
-        fresh_ratio = fresh_count / len(wallet_ages) if wallet_ages else 0
+        # 2. Ambil owner addresses dari top 15 token accounts (batch)
+        top_token_accounts = [h.get("address") for h in holders[:15] if h.get("address")]
+        owners = await client.get_multiple_token_account_owners(top_token_accounts)
+        unique_owners = list({o for o in owners if o})
 
-        # Hitung rata-rata age (dalam jumlah tx sebagai proxy)
-        avg_tx_count = sum(wallet_ages) / len(wallet_ages) if wallet_ages else 0
+        if not unique_owners:
+            return True, {
+                "error": "Cannot resolve token account owners",
+                "holder_count": holder_count,
+            }
+
+        # 3. Untuk tiap owner, cek tx count (proxy wallet age)
+        tx_counts = await _get_wallet_tx_counts(unique_owners, client)
+
+        # 4. Hitung fresh wallets
+        fresh_threshold = config.FRESH_WALLET_TX_THRESHOLD
+        fresh_count = sum(1 for c in tx_counts if c < fresh_threshold)
+        checked = len(tx_counts)
+        fresh_ratio = fresh_count / checked if checked else 0.0
+        avg_tx = sum(tx_counts) / checked if checked else 0.0
 
         flag = fresh_ratio > config.MAX_FRESH_WALLET_RATIO
+
         reasons = []
         if flag:
             reasons.append(
-                f"{fresh_count}/{len(wallet_ages)} buyer wallets fresh "
+                f"{fresh_count}/{checked} top holder wallets fresh "
                 f"(ratio {fresh_ratio:.0%} > max {config.MAX_FRESH_WALLET_RATIO:.0%})"
             )
 
         return flag, {
             "holder_count": holder_count,
-            "wallets_checked": len(wallet_ages),
+            "unique_owners_checked": checked,
             "fresh_wallet_count": fresh_count,
             "fresh_wallet_ratio": round(fresh_ratio, 3),
-            "avg_wallet_tx_count": round(avg_tx_count, 1),
+            "avg_wallet_tx_count": round(avg_tx, 1),
             "bundle_suspected": flag,
             "reasons": reasons,
         }
@@ -85,46 +91,18 @@ async def check(
         return False, {"error": str(e), "assumed": "ok"}
 
 
-async def _extract_buyers(mint: str, sigs: list[dict], client: SolanaClient) -> list[str]:
+async def _get_wallet_tx_counts(wallets: list[str], client: SolanaClient) -> list[int]:
     """
-    Ambil unique wallet addresses yang berinteraksi dengan token di awal.
-    Simplified: ambil dari fee payers transaksi awal.
-    """
-    buyers = set()
-    tasks = [client.get_transaction(s["signature"]) for s in sigs[:8]]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for result in results:
-        if isinstance(result, Exception) or not result:
-            continue
-        try:
-            account_keys = (
-                result.get("transaction", {})
-                .get("message", {})
-                .get("accountKeys", [])
-            )
-            # Fee payer (index 0) adalah buyer/interactor utama
-            if account_keys:
-                buyers.add(account_keys[0])
-        except Exception:
-            continue
-
-    return list(buyers)
-
-
-async def _check_wallet_ages(wallets: list[str], client: SolanaClient) -> list[int]:
-    """
-    Proxy untuk wallet age: jumlah transaksi total wallet.
-    Wallet fresh = sedikit tx.
+    Ambil tx count untuk tiap wallet (paralel).
+    Tx count < threshold = wallet fresh (baru dibuat).
     """
     tasks = [client.get_signatures_for_address(w, limit=20) for w in wallets]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    ages = []
-    for result in results:
-        if isinstance(result, Exception) or result is None:
-            ages.append(100)  # unknown = assume ok
-            continue
-        ages.append(len(result))
-
-    return ages
+    counts = []
+    for r in results:
+        if isinstance(r, Exception) or r is None:
+            counts.append(100)  # unknown = assume not fresh
+        else:
+            counts.append(len(r))
+    return counts

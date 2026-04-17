@@ -20,9 +20,6 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
-# Estimasi SOL price untuk konversi liquidity (fallback static)
-_SOL_PRICE_FALLBACK_USD = 150.0
-
 
 async def check(
     mint: str,
@@ -46,7 +43,7 @@ async def check(
             # Tidak ada data market = token baru banget, terlalu risiko
             return True, {
                 "error": "No market data yet",
-                "reason": "Token mungkin belum terdaftar di DEX",
+                "reasons": ["Token mungkin belum terdaftar di DEX"],
             }
 
         price_usd   = float(dex_data.get("priceUsd") or 0)
@@ -57,8 +54,9 @@ async def check(
         vol_5m      = float((dex_data.get("volume") or {}).get("m5") or 0)
         vol_1h      = float((dex_data.get("volume") or {}).get("h1") or 0)
 
-        # Estimasi SOL liquidity dari USD
-        liq_sol = liq_usd / _SOL_PRICE_FALLBACK_USD
+        # Estimasi SOL liquidity dari USD (pakai harga SOL real-time)
+        sol_price = await client.get_sol_price_usd()
+        liq_sol = liq_usd / sol_price if sol_price else 0
 
         mcap_too_low  = market_cap < config.MIN_MARKET_CAP_USD
         mcap_too_high = market_cap > config.MAX_MARKET_CAP_USD
