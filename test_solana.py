@@ -35,6 +35,8 @@ def _make_mock_client(**overrides):
     client = MagicMock(spec=SolanaClient)
     # Pair created 1 menit lalu — fresh untuk semua mode
     pair_created_ms = int(time.time() * 1000) - 60_000
+    # RPC call counter (non-mock attribute)
+    client.rpc_call_count = 0
     defaults = {
         "get_mint_info": AsyncMock(return_value={
             "mint_authority_revoked": True,
@@ -53,6 +55,7 @@ def _make_mock_client(**overrides):
         "get_signatures_for_address": AsyncMock(return_value=[
             {"signature": f"sig{i}"} for i in range(50)  # 50 tx = not fresh
         ]),
+        "get_wallet_tx_count_cached": AsyncMock(return_value=50),  # 50 tx = not fresh
         "get_priority_fee": AsyncMock(return_value=50_000),
         "get_dexscreener_data_retry": AsyncMock(return_value={
             "baseToken": {"symbol": "TEST", "name": "Test Token"},
@@ -166,9 +169,7 @@ def test_wallet_analysis_many_fresh_wallets():
     """Terlalu banyak wallet fresh → bundle flag."""
     from filters import wallet_analysis
     client = _make_mock_client(
-        get_signatures_for_address=AsyncMock(return_value=[
-            {"signature": "s1"}, {"signature": "s2"}  # hanya 2 tx = fresh
-        ])
+        get_wallet_tx_count_cached=AsyncMock(return_value=2),  # hanya 2 tx = fresh
     )
     flag, details = asyncio.run(wallet_analysis.check("mint123", client, Config))
     assert flag is True

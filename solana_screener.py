@@ -3,12 +3,20 @@ Solana Screener — Orchestrator
 ────────────────────────────────
 Jalankan 5 filter secara terstruktur untuk setiap new pair yang terdeteksi.
 
-Urutan:
-  Filter 0 (token_safety) → AUTO SKIP jika flag, jangan proses lebih lanjut
-  Filter 1-4 dijalankan paralel → hitung total flags
-  0-1 flag → GAS IT | 2+ flag → SKIP
+Pipeline HEMAT RPC:
+  1. Filter 0 (token_safety)  → 1 RPC call, AUTO SKIP jika flag
+  2. Fetch DexScreener        → 0 RPC calls (gratis)
+  3. Filter 4 (entry_quality) → 0 RPC calls (pakai data DexScreener)
+     → EARLY EXIT jika mcap/pair age di luar range
+  4. Filter 1 (network)       → 1 RPC call (cached 30s)
+  5. Fetch token holders      → 2 RPC calls (shared antara filter 2 & 3)
+  6. Filter 2 (wallet_analysis) → 8 RPC calls (top 8 owner wallet age)
+  7. Filter 3 (holder_quality)  → 0 extra (reuse data step 5)
 
-Kirim hasil ke Telegram jika GAS IT (atau semua hasil jika mau monitor penuh).
+Total WORST case: ~12 calls per token (turun dari ~21)
+Token yang di-skip awal: 1-2 calls saja
+
+Kirim hasil ke Telegram jika GAS IT.
 """
 
 import asyncio
@@ -70,6 +78,8 @@ class SolanaTokenResult:
 
     # Agregasi
     flag_reasons: list[str] = field(default_factory=list)
+    rpc_calls_used: int = 0
+    skipped_early: bool = False
 
     @property
     def total_flags(self) -> int:
@@ -99,6 +109,7 @@ class SolanaTokenResult:
             f"  Priority fee: {self.priority_fee_microlamports:,} microlamports",
             f"  LP Burned: {self.lp_burned}",
             f"  Flags: {self.total_flags}/4  →  {self.decision}",
+            f"  RPC calls: {self.rpc_calls_used}",
         ]
         if self.flag_reasons:
             lines.append("  Reasons:")
@@ -109,8 +120,8 @@ class SolanaTokenResult:
 
 class SolanaScreener:
     """
-    Orchestrator utama.
-    Semua filter dijalankan dan hasilnya dikumpulkan ke SolanaTokenResult.
+    Orchestrator utama dengan pipeline hemat RPC.
+    Filter diurutkan dari murah ke mahal — early exit jika sudah jelas SKIP.
     """
 
     def __init__(self, config: type[Config] = Config):
@@ -119,19 +130,28 @@ class SolanaScreener:
             rpc_url=config.rpc_url(),
             helius_api_key=config.HELIUS_API_KEY,
         )
+        self._stats = {"total": 0, "gas_it": 0, "skip": 0, "rpc_total": 0}
+
+    @property
+    def stats(self):
+        return self._stats.copy()
 
     async def close(self):
         await self.client.close()
 
     async def screen(self, mint: str) -> SolanaTokenResult:
         """
-        Jalankan full screening pipeline untuk sebuah token mint address.
+        Pipeline screening hemat RPC:
+        1. Safety check (1 call) → auto skip
+        2. DexScreener (FREE) + entry quality → early exit
+        3. Network + wallet + holder (parallel, only if needed)
         """
         result = SolanaTokenResult(mint=mint)
         start = time.time()
+        rpc_before = self.client.rpc_call_count
         logger.info(f"Screening: {mint}")
 
-        # ── Filter 0: Token Safety (blocking check) ─────────────────────
+        # ─── PHASE 1: Token Safety (1 RPC call) ──────────────────────
         safety_flag, safety_det = await token_safety.check(mint, self.client)
         result.safety_flag = safety_flag
         result.mint_authority_revoked = safety_det.get("mint_authority_revoked", False)
@@ -141,65 +161,112 @@ class SolanaScreener:
         if safety_flag:
             reasons = safety_det.get("reasons", [])
             result.flag_reasons.extend(reasons or ["Token safety check failed"])
-            logger.info(f"AUTO SKIP (safety): {mint} — {reasons}")
+            result.rpc_calls_used = self.client.rpc_call_count - rpc_before
+            self._record(result)
+            logger.info(f"AUTO SKIP (safety): {mint} [{result.rpc_calls_used} RPC calls]")
             return result
 
-        # ── Fetch DexScreener data sekali, share ke filter lain ─────────
+        # ─── PHASE 2: DexScreener + Entry Quality (0 RPC calls) ──────
         dex_data = await self.client.get_dexscreener_data_retry(mint, retries=3, delay=8.0)
         _enrich_metadata(result, dex_data)
 
-        # ── Filter 1-4: Jalankan paralel ─────────────────────────────────
-        net_task    = network.check(self.client, self.config)
-        wallet_task = wallet_analysis.check(mint, self.client, self.config)
-        holder_task = holder_quality.check(mint, self.client, self.config)
-        entry_task  = entry_quality.check(mint, self.client, self.config, dex_data)
+        entry_flag, entry_det = await entry_quality.check(
+            mint, self.client, self.config, dex_data
+        )
+        result.entry_flag = entry_flag
+        result.market_cap_usd = entry_det.get("market_cap_usd", 0.0)
+        result.liquidity_usd = entry_det.get("liquidity_usd", 0.0)
+        result.liquidity_sol_est = entry_det.get("liquidity_sol_est", 0.0)
+        result.volume_5m_usd = entry_det.get("volume_5m_usd", 0.0)
+        result.mcap_tier = entry_det.get("mcap_tier", "")
+        result.dex_pair_url = entry_det.get("dex_pair_url", "")
+        result.entry_details = entry_det
+        if entry_det.get("reasons"):
+            result.flag_reasons.extend(entry_det["reasons"])
 
-        (
-            (net_flag, net_det),
-            (wallet_flag, wallet_det),
-            (holder_flag, holder_det),
-            (entry_flag, entry_det),
-        ) = await asyncio.gather(net_task, wallet_task, holder_task, entry_task)
+        # Early exit: entry sudah flag → cek network saja (murah)
+        # Jika network juga flag → 2 flags → pasti SKIP, hemat wallet analysis
+        if entry_flag:
+            net_flag, net_det = await network.check(self.client, self.config)
+            result.network_flag = net_flag
+            result.priority_fee_microlamports = net_det.get("priority_fee_microlamports", 0)
+            result.network_details = net_det
+            if net_det.get("reasons"):
+                result.flag_reasons.extend(net_det["reasons"])
 
-        # ── Populate result ───────────────────────────────────────────────
-        result.network_flag                = net_flag
-        result.priority_fee_microlamports  = net_det.get("priority_fee_microlamports", 0)
-        result.network_details             = net_det
+            if net_flag:
+                # 2 flags (entry + network) → SKIP, skip wallet analysis
+                result.skipped_early = True
+                result.rpc_calls_used = self.client.rpc_call_count - rpc_before
+                self._record(result)
+                logger.info(
+                    f"EARLY SKIP (entry+net): {mint} "
+                    f"[{result.rpc_calls_used} RPC calls saved]"
+                )
+                return result
 
-        result.wallet_flag        = wallet_flag
-        result.holder_count       = wallet_det.get("holder_count", 0)
+        # ─── PHASE 3: Full Analysis (parallel, shared data) ──────────
+        # Fetch holders SEKALI, share ke wallet_analysis & holder_quality
+        holders_data = await self.client.get_token_largest_accounts(mint)
+        supply = await self.client.get_token_supply(mint)
+
+        # Run filter 1 + 2 + 3 in parallel (network might already be done)
+        tasks = []
+        need_network = not entry_flag  # belum dicek di phase 2
+
+        if need_network:
+            tasks.append(network.check(self.client, self.config))
+        tasks.append(
+            wallet_analysis.check(mint, self.client, self.config,
+                                  holders_data=holders_data)
+        )
+        tasks.append(
+            holder_quality.check(mint, self.client, self.config,
+                                 holders_data=holders_data, supply=supply)
+        )
+
+        results = await asyncio.gather(*tasks)
+        idx = 0
+
+        if need_network:
+            net_flag, net_det = results[idx]; idx += 1
+            result.network_flag = net_flag
+            result.priority_fee_microlamports = net_det.get("priority_fee_microlamports", 0)
+            result.network_details = net_det
+            if net_det.get("reasons"):
+                result.flag_reasons.extend(net_det["reasons"])
+
+        wallet_flag, wallet_det = results[idx]; idx += 1
+        result.wallet_flag = wallet_flag
+        result.holder_count = wallet_det.get("holder_count", 0)
         result.fresh_wallet_count = wallet_det.get("fresh_wallet_count", 0)
         result.fresh_wallet_ratio = wallet_det.get("fresh_wallet_ratio", 0.0)
-        result.wallet_details     = wallet_det
+        result.wallet_details = wallet_det
+        if wallet_det.get("reasons"):
+            result.flag_reasons.extend(wallet_det["reasons"])
 
-        result.holder_flag         = holder_flag
-        result.top1_holder_pct     = holder_det.get("top1_holder_pct", 0.0)
-        result.top10_combined_pct  = holder_det.get("top10_combined_pct", 0.0)
-        result.lp_burned           = holder_det.get("lp_burned", False)
-        result.holder_details      = holder_det
+        holder_flag, holder_det = results[idx]; idx += 1
+        result.holder_flag = holder_flag
+        result.top1_holder_pct = holder_det.get("top1_holder_pct", 0.0)
+        result.top10_combined_pct = holder_det.get("top10_combined_pct", 0.0)
+        result.lp_burned = holder_det.get("lp_burned", False)
+        result.holder_details = holder_det
+        if holder_det.get("reasons"):
+            result.flag_reasons.extend(holder_det["reasons"])
 
-        result.entry_flag        = entry_flag
-        result.market_cap_usd    = entry_det.get("market_cap_usd", 0.0)
-        result.liquidity_usd     = entry_det.get("liquidity_usd", 0.0)
-        result.liquidity_sol_est = entry_det.get("liquidity_sol_est", 0.0)
-        result.volume_5m_usd     = entry_det.get("volume_5m_usd", 0.0)
-        result.mcap_tier         = entry_det.get("mcap_tier", "")
-        result.dex_pair_url      = entry_det.get("dex_pair_url", "")
-        result.entry_details     = entry_det
-
-        # Kumpulkan semua reasons
-        for det in [net_det, wallet_det, holder_det, entry_det]:
-            result.flag_reasons.extend(det.get("reasons", []))
-
+        # ─── Done ─────────────────────────────────────────────────────
+        result.rpc_calls_used = self.client.rpc_call_count - rpc_before
         elapsed = time.time() - start
-        logger.info(f"Screened in {elapsed:.1f}s | {result.decision} ({result.total_flags}/4 flags) | {mint}")
-
+        self._record(result)
+        logger.info(
+            f"Screened in {elapsed:.1f}s | {result.decision} "
+            f"({result.total_flags}/4 flags) | {mint} "
+            f"[{result.rpc_calls_used} RPC calls]"
+        )
         return result
 
     async def screen_and_notify(self, mint: str) -> SolanaTokenResult:
-        """
-        Screen token dan kirim Telegram alert jika GAS IT.
-        """
+        """Screen token dan kirim Telegram alert jika GAS IT."""
         result = await self.screen(mint)
         print(result.summary())
 
@@ -214,6 +281,22 @@ class SolanaScreener:
 
         return result
 
+    def _record(self, result: SolanaTokenResult):
+        self._stats["total"] += 1
+        self._stats["rpc_total"] += result.rpc_calls_used
+        if result.is_gas_it:
+            self._stats["gas_it"] += 1
+        else:
+            self._stats["skip"] += 1
+        if self._stats["total"] % 50 == 0:
+            logger.info(
+                f"Stats: {self._stats['total']} screened, "
+                f"{self._stats['gas_it']} GAS IT, "
+                f"{self._stats['skip']} SKIP, "
+                f"{self._stats['rpc_total']} total RPC calls "
+                f"(avg {self._stats['rpc_total'] / self._stats['total']:.1f}/token)"
+            )
+
 
 def _enrich_metadata(result: SolanaTokenResult, dex_data: dict):
     """Isi nama dan simbol dari DexScreener data."""
@@ -221,8 +304,7 @@ def _enrich_metadata(result: SolanaTokenResult, dex_data: dict):
         return
     base = dex_data.get("baseToken") or {}
     result.symbol = base.get("symbol", "UNKNOWN")
-    result.name   = base.get("name", "Unknown Token")
-    # Pair age dari pairCreatedAt (unix ms)
+    result.name = base.get("name", "Unknown Token")
     created_at = dex_data.get("pairCreatedAt")
     if created_at:
         result.pair_age_seconds = time.time() - (created_at / 1000)

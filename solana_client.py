@@ -42,6 +42,9 @@ class SolanaClient:
         self.helius_api_key = helius_api_key
         self._http = httpx.AsyncClient(timeout=timeout, headers=_DEFAULT_HEADERS)
         self._sol_price_cache: tuple[float, float] | None = None  # (price, timestamp)
+        self.rpc_call_count: int = 0
+        self._priority_fee_cache: tuple[int, float] | None = None  # (fee, timestamp)
+        self._wallet_age_cache: dict[str, tuple[int, float]] = {}  # addr → (tx_count, timestamp)
 
     async def close(self):
         await self._http.aclose()
@@ -49,6 +52,7 @@ class SolanaClient:
     # ── Solana RPC ─────────────────────────────────────────────────────────
 
     async def _rpc(self, method: str, params: list) -> dict | list | None:
+        self.rpc_call_count += 1
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
             r = await self._http.post(self.rpc_url, json=payload)
@@ -109,22 +113,33 @@ class SolanaClient:
     async def get_priority_fee(self) -> int:
         """
         Estimasi priority fee jaringan saat ini (microlamports).
-        Fallback ke average recent prioritization fees.
+        Cached 30 detik — priority fee global, tidak perlu fetch per token.
         """
-        # Coba getPriorityFeeEstimate (Helius extension)
+        import time as _time
+        CACHE_TTL = 30.0
+
+        if self._priority_fee_cache:
+            fee, ts = self._priority_fee_cache
+            if _time.time() - ts < CACHE_TTL:
+                self.rpc_call_count -= 0  # no RPC call needed
+                return fee
+
         result = await self._rpc(
             "getPriorityFeeEstimate",
             [{"accountKeys": [], "options": {"priorityLevel": "High"}}],
         )
         if isinstance(result, dict) and "priorityFeeEstimate" in result:
-            return int(result["priorityFeeEstimate"])
+            fee = int(result["priorityFeeEstimate"])
+            self._priority_fee_cache = (fee, _time.time())
+            return fee
 
-        # Fallback: average dari recent fees
         fees = await self._rpc("getRecentPrioritizationFees", [[]])
         if fees:
             vals = [f["prioritizationFee"] for f in fees if f.get("prioritizationFee")]
             if vals:
-                return int(sum(vals) / len(vals))
+                fee = int(sum(vals) / len(vals))
+                self._priority_fee_cache = (fee, _time.time())
+                return fee
         return 0
 
     async def get_token_account_balance(self, token_account: str) -> int:
@@ -185,6 +200,33 @@ class SolanaClient:
         while len(owners) < len(token_accounts):
             owners.append(None)
         return owners
+
+    async def get_wallet_tx_count_cached(self, wallet: str, limit: int = 20) -> int:
+        """
+        Ambil jumlah tx sebuah wallet, cached 10 menit.
+        Whales / market makers yang sama sering muncul di banyak token.
+        """
+        import time as _time
+        CACHE_TTL = 600.0  # 10 menit
+
+        if wallet in self._wallet_age_cache:
+            count, ts = self._wallet_age_cache[wallet]
+            if _time.time() - ts < CACHE_TTL:
+                return count
+
+        sigs = await self.get_signatures_for_address(wallet, limit=limit)
+        count = len(sigs) if sigs else 0
+        self._wallet_age_cache[wallet] = (count, _time.time())
+
+        # Prune cache kalau terlalu besar
+        if len(self._wallet_age_cache) > 5000:
+            now = _time.time()
+            self._wallet_age_cache = {
+                k: v for k, v in self._wallet_age_cache.items()
+                if now - v[1] < CACHE_TTL
+            }
+
+        return count
 
     # ── Helius Enhanced Transactions ───────────────────────────────────────
 
