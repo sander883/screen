@@ -54,6 +54,11 @@ async def check(
         vol_5m      = float((dex_data.get("volume") or {}).get("m5") or 0)
         vol_1h      = float((dex_data.get("volume") or {}).get("h1") or 0)
 
+        # Hitung umur pair (detik sejak LP dibuat)
+        import time
+        pair_created_ms = dex_data.get("pairCreatedAt") or 0
+        pair_age_sec = (time.time() * 1000 - pair_created_ms) / 1000 if pair_created_ms else 0
+
         # Estimasi SOL liquidity dari USD (pakai harga SOL real-time)
         sol_price = await client.get_sol_price_usd()
         liq_sol = liq_usd / sol_price if sol_price else 0
@@ -61,8 +66,10 @@ async def check(
         mcap_too_low  = market_cap < config.MIN_MARKET_CAP_USD
         mcap_too_high = market_cap > config.MAX_MARKET_CAP_USD
         liq_too_low   = liq_sol < config.MIN_LIQUIDITY_SOL
+        max_age = getattr(config, "MAX_PAIR_AGE_SECONDS", 0)
+        pair_too_old = bool(max_age) and pair_age_sec > max_age
 
-        flag = mcap_too_low or mcap_too_high or liq_too_low
+        flag = mcap_too_low or mcap_too_high or liq_too_low or pair_too_old
 
         reasons = []
         if mcap_too_low:
@@ -71,6 +78,10 @@ async def check(
             reasons.append(f"MCap terlalu tinggi: ${market_cap:,.0f} (max ${config.MAX_MARKET_CAP_USD:,.0f})")
         if liq_too_low:
             reasons.append(f"Liquidity tipis: {liq_sol:.1f} SOL (min {config.MIN_LIQUIDITY_SOL} SOL)")
+        if pair_too_old:
+            reasons.append(
+                f"Pair terlalu lama: {int(pair_age_sec/60)}m (max {int(max_age/60)}m) — bukan fresh"
+            )
 
         # Tentukan mcap tier untuk context
         tier = _get_mcap_tier(market_cap)
@@ -82,6 +93,7 @@ async def check(
             "liquidity_sol_est": round(liq_sol, 2),
             "volume_5m_usd": round(vol_5m, 2),
             "volume_1h_usd": round(vol_1h, 2),
+            "pair_age_seconds": round(pair_age_sec, 0),
             "mcap_tier": tier,
             "reasons": reasons,
             "dex_pair_url": dex_data.get("url", ""),

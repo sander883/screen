@@ -171,7 +171,7 @@ async def test_mode():
         except Exception as e:
             print(f"    Telegram Bot: FAILED — {e}")
 
-    print("\n── Filter Thresholds ───────────────────────────")
+    print(f"\n── Filter Thresholds (mode: {Config.MODE.upper()}) ────────────────")
     print(f"  Max priority fee : {Config.MAX_PRIORITY_FEE_MICROLAMPORTS:,} microlamports")
     print(f"  Min holder count : {Config.MIN_HOLDER_COUNT}")
     print(f"  Max fresh wallets: {Config.MAX_FRESH_WALLET_RATIO:.0%}")
@@ -179,7 +179,10 @@ async def test_mode():
     print(f"  Max top10 holder : {Config.MAX_TOP10_COMBINED_PCT}%")
     print(f"  MCap range       : ${Config.MIN_MARKET_CAP_USD:,.0f} - ${Config.MAX_MARKET_CAP_USD:,.0f}")
     print(f"  Min liquidity    : {Config.MIN_LIQUIDITY_SOL} SOL")
-    print("────────────────────────────────────────────────\n")
+    print(f"  Max pair age     : {Config.MAX_PAIR_AGE_SECONDS // 60} menit")
+    print("────────────────────────────────────────────────")
+    print(f"  Ubah mode: SCREENING_MODE=fresh|standard|safe di .env")
+    print()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

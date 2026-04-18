@@ -31,7 +31,10 @@ def _build_mint_layout(mint_auth_revoked: bool, freeze_auth_revoked: bool,
 
 def _make_mock_client(**overrides):
     """Buat SolanaClient dengan async methods di-mock."""
+    import time
     client = MagicMock(spec=SolanaClient)
+    # Pair created 1 menit lalu — fresh untuk semua mode
+    pair_created_ms = int(time.time() * 1000) - 60_000
     defaults = {
         "get_mint_info": AsyncMock(return_value={
             "mint_authority_revoked": True,
@@ -57,7 +60,7 @@ def _make_mock_client(**overrides):
             "marketCap": 100_000,
             "liquidity": {"usd": 15_000},
             "volume": {"m5": 500, "h1": 5000},
-            "pairCreatedAt": 1700000000000,
+            "pairCreatedAt": pair_created_ms,
         }),
         "get_sol_price_usd": AsyncMock(return_value=150.0),
         "close": AsyncMock(),
@@ -236,14 +239,16 @@ def test_entry_quality_mcap_too_high():
 
 
 def test_entry_quality_liquidity_too_low():
-    """Liquidity < 10 SOL → flag."""
+    """Liquidity < MIN_LIQUIDITY_SOL → flag."""
+    import time
     from filters import entry_quality
     dex_data = {
         "baseToken": {"symbol": "TEST"},
         "priceUsd": "0.001",
         "marketCap": 100_000,
-        "liquidity": {"usd": 500},  # @ $150 SOL = ~3.3 SOL
+        "liquidity": {"usd": 200},  # @ $150 SOL = ~1.3 SOL (di bawah threshold fresh 3 SOL)
         "volume": {"m5": 100, "h1": 1000},
+        "pairCreatedAt": int(time.time() * 1000) - 60_000,  # baru 1 menit lalu
     }
     client = _make_mock_client()
     flag, details = asyncio.run(entry_quality.check("m", client, Config, dex_data))
