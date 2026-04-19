@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 from config import Config
 from solana_client import SolanaClient
+from pumpfun_client import PumpFunClient
 from filters import token_safety, network, wallet_analysis, holder_quality, entry_quality
 from notifier.telegram import send_alert
 
@@ -130,6 +131,7 @@ class SolanaScreener:
             rpc_url=config.rpc_url(),
             helius_api_key=config.HELIUS_API_KEY,
         )
+        self.pumpfun = PumpFunClient(self.client)
         self._stats = {"total": 0, "gas_it": 0, "skip": 0, "rpc_total": 0}
 
     @property
@@ -168,6 +170,15 @@ class SolanaScreener:
 
         # ─── PHASE 2: DexScreener + Entry Quality (0 RPC calls) ──────
         dex_data = await self.client.get_dexscreener_data_retry(mint, retries=3, delay=8.0)
+
+        # Fallback ke Pump.fun on-chain bonding curve kalau DexScreener kosong
+        # (token pre-graduation belum terindeks di DexScreener)
+        if not dex_data:
+            sol_price = await self.client.get_sol_price_usd()
+            dex_data = await self.pumpfun.get_market_data(mint, sol_price)
+            if dex_data:
+                logger.info(f"Using pump.fun on-chain data for {mint}")
+
         _enrich_metadata(result, dex_data)
 
         entry_flag, entry_det = await entry_quality.check(

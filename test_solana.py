@@ -369,6 +369,158 @@ def test_telegram_format_skip():
     assert "Scm777" in msg
 
 
+# ── Pump.fun Client Tests ──────────────────────────────────────────────────
+
+def _build_bonding_curve_data(
+    virtual_token: int = 1_073_000_000 * 10**6,
+    virtual_sol: int = 30 * 1_000_000_000,
+    real_token: int = 793_100_000 * 10**6,
+    real_sol: int = 0,
+    total_supply: int = 1_000_000_000 * 10**6,
+    complete: bool = False,
+) -> str:
+    """Build fake bonding curve account data (base64)."""
+    buf = bytearray(81)
+    # discriminator 0..7
+    struct.pack_into("<Q", buf, 8,  virtual_token)
+    struct.pack_into("<Q", buf, 16, virtual_sol)
+    struct.pack_into("<Q", buf, 24, real_token)
+    struct.pack_into("<Q", buf, 32, real_sol)
+    struct.pack_into("<Q", buf, 40, total_supply)
+    buf[48] = 1 if complete else 0
+    return base64.b64encode(bytes(buf)).decode()
+
+
+def test_pumpfun_pda_deterministic():
+    """PDA derivation harus deterministic untuk mint yang sama."""
+    from pumpfun_client import derive_bonding_curve_pda
+    mint = "Fh7mLxtPAysdvHcMcJ37A3vc6WvBVh7JVDwxmwk6pump"
+    pda1 = derive_bonding_curve_pda(mint)
+    pda2 = derive_bonding_curve_pda(mint)
+    assert pda1 == pda2
+    assert len(pda1) >= 32  # base58 pubkey
+
+
+def test_pumpfun_parse_bonding_curve():
+    """Parse bonding curve layout."""
+    from pumpfun_client import parse_bonding_curve_account
+    data = _build_bonding_curve_data(
+        virtual_token=1_073_000_000 * 10**6,
+        virtual_sol=30 * 1_000_000_000,
+        real_token=500_000_000 * 10**6,
+        real_sol=5 * 1_000_000_000,
+        total_supply=1_000_000_000 * 10**6,
+        complete=False,
+    )
+    state = parse_bonding_curve_account("mint123", data)
+    assert state is not None
+    assert state.virtual_token_reserves == 1_073_000_000 * 10**6
+    assert state.virtual_sol_reserves == 30 * 1_000_000_000
+    assert state.real_sol_reserves == 5 * 1_000_000_000
+    assert state.complete is False
+
+
+def test_pumpfun_parse_complete_flag():
+    """Complete=True harus ter-parse benar."""
+    from pumpfun_client import parse_bonding_curve_account
+    data = _build_bonding_curve_data(complete=True)
+    state = parse_bonding_curve_account("mint123", data)
+    assert state.complete is True
+
+
+def test_pumpfun_parse_invalid():
+    """Data invalid → None."""
+    from pumpfun_client import parse_bonding_curve_account
+    assert parse_bonding_curve_account("mint", "") is None
+    assert parse_bonding_curve_account("mint", "aW52YWxpZA==") is None
+
+
+def test_pumpfun_market_cap_sol():
+    """Market cap SOL formula: (supply × virtual_sol) / virtual_token / LAMPORTS."""
+    from pumpfun_client import BondingCurveState
+    state = BondingCurveState(
+        mint="x",
+        virtual_token_reserves=1_073_000_000 * 10**6,
+        virtual_sol_reserves=30 * 1_000_000_000,
+        real_token_reserves=793_100_000 * 10**6,
+        real_sol_reserves=0,
+        token_total_supply=1_000_000_000 * 10**6,
+        complete=False,
+    )
+    mcap_sol = state.market_cap_sol()
+    # (1e9 × 30) / 1.073e9 ≈ 27.96 SOL
+    assert 27 < mcap_sol < 29
+
+
+def test_pumpfun_progress_pct():
+    """Progress pct naik seiring real_token turun."""
+    from pumpfun_client import BondingCurveState
+    # Fresh: belum ada yang beli
+    fresh = BondingCurveState(
+        mint="x", virtual_token_reserves=1, virtual_sol_reserves=1,
+        real_token_reserves=793_100_000 * 10**6, real_sol_reserves=0,
+        token_total_supply=1, complete=False,
+    )
+    assert fresh.progress_pct() < 1.0
+
+    # Setengah terjual
+    half = BondingCurveState(
+        mint="x", virtual_token_reserves=1, virtual_sol_reserves=1,
+        real_token_reserves=(793_100_000 // 2) * 10**6, real_sol_reserves=0,
+        token_total_supply=1, complete=False,
+    )
+    assert 49 < half.progress_pct() < 51
+
+
+def test_pumpfun_liquidity_sol():
+    """Liquidity = real_sol_reserves / LAMPORTS."""
+    from pumpfun_client import BondingCurveState
+    state = BondingCurveState(
+        mint="x", virtual_token_reserves=1, virtual_sol_reserves=1,
+        real_token_reserves=1, real_sol_reserves=12_500_000_000,  # 12.5 SOL
+        token_total_supply=1, complete=False,
+    )
+    assert abs(state.liquidity_sol() - 12.5) < 0.001
+
+
+def test_pumpfun_get_market_data_shape():
+    """get_market_data output kompatibel DexScreener shape."""
+    import pumpfun_client
+    from pumpfun_client import PumpFunClient
+    bc_data = _build_bonding_curve_data(
+        virtual_token=1_073_000_000 * 10**6,
+        virtual_sol=30 * 1_000_000_000,
+        real_token=500_000_000 * 10**6,
+        real_sol=5 * 1_000_000_000,
+        total_supply=1_000_000_000 * 10**6,
+    )
+    solana = MagicMock()
+    solana._rpc = AsyncMock(return_value={"value": {"data": [bc_data, "base64"]}})
+    pf = PumpFunClient(solana)
+    result = asyncio.run(pf.get_market_data(
+        "Fh7mLxtPAysdvHcMcJ37A3vc6WvBVh7JVDwxmwk6pump", sol_price_usd=150.0
+    ))
+    assert "priceUsd" in result
+    assert "marketCap" in result
+    assert result["liquidity"]["sol"] == 5.0
+    assert result["liquidity"]["usd"] == 750.0  # 5 SOL × $150
+    assert result["source"] == "pumpfun_bonding_curve"
+    assert "bonding_curve" in result
+    assert result["bonding_curve"]["complete"] is False
+
+
+def test_pumpfun_get_market_data_missing_account():
+    """Account tidak ada → return empty dict."""
+    from pumpfun_client import PumpFunClient
+    solana = MagicMock()
+    solana._rpc = AsyncMock(return_value={"value": None})
+    pf = PumpFunClient(solana)
+    result = asyncio.run(pf.get_market_data(
+        "Fh7mLxtPAysdvHcMcJ37A3vc6WvBVh7JVDwxmwk6pump", sol_price_usd=150.0
+    ))
+    assert result == {}
+
+
 # ── Runner ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
