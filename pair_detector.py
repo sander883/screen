@@ -131,7 +131,24 @@ class PairDetector:
                 else:
                     raise
             except Exception as e:
-                logger.warning(f"WebSocket error: {e} | Reconnect in {backoff:.0f}s")
+                err_str = str(e)
+                if "429" in err_str:
+                    self._ws_429_count += 1
+                    logger.warning(
+                        f"WebSocket 429 ({self._ws_429_count}/{_MAX_WS_429_BEFORE_FALLBACK})"
+                    )
+                    if self._ws_429_count >= _MAX_WS_429_BEFORE_FALLBACK:
+                        if self.gmgn_api_key:
+                            logger.info("Switching to GMGN polling (WebSocket rate limited)")
+                            self._mode = "gmgn"
+                        else:
+                            logger.info("Switching to HTTP polling (WebSocket rate limited)")
+                            self._mode = "polling"
+                        return
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                else:
+                    logger.warning(f"WebSocket error: {e} | Reconnect in {backoff:.0f}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
 
