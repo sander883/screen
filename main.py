@@ -51,6 +51,7 @@ async def live_mode():
         helius_api_key=Config.HELIUS_API_KEY,
         on_new_pair=screener.screen_and_notify,
         max_concurrent=3,
+        rpc_url=Config.rpc_url(),
     )
 
     logger.info("=" * 55)
@@ -99,7 +100,7 @@ async def scan_mode(mint: str):
         logger.info(f"Scanning: {mint}")
         result = await screener.screen_and_notify(mint)
         if not result.is_gas_it:
-            print(f"\nDecision: {result.decision} ({result.total_flags}/4 flags)")
+            print(f"\nDecision: {result.decision} ({result.total_flags}/5 flags)")
     finally:
         await screener.close()
 
@@ -180,6 +181,10 @@ async def test_mode():
     print(f"  MCap range       : ${Config.MIN_MARKET_CAP_USD:,.0f} - ${Config.MAX_MARKET_CAP_USD:,.0f}")
     print(f"  Min liquidity    : {Config.MIN_LIQUIDITY_SOL} SOL")
     print(f"  Max pair age     : {Config.MAX_PAIR_AGE_SECONDS // 60} menit")
+    print(f"  Max MCap:Liq     : {Config.MAX_MCAP_LIQ_RATIO}x")
+    print(f"  Min avg wallet   : {Config.MIN_AVG_WALLET_AGE_DAYS:.0f} days")
+    print(f"  Min wallet std   : {Config.MIN_WALLET_AGE_STD_DAYS:.0f} days")
+    print(f"  Max bundle slot  : {Config.MAX_BUNDLE_SAME_SLOT}")
     print("────────────────────────────────────────────────")
     print(f"  Ubah mode: SCREENING_MODE=fresh|standard|safe di .env")
     print()
