@@ -90,6 +90,8 @@ class SolanaTokenResult:
     def decision(self) -> str:
         if self.safety_flag:
             return "SKIP"
+        if self.entry_flag:
+            return "SKIP"
         return "SKIP" if self.total_flags >= 2 else "GAS IT"
 
     @property
@@ -195,59 +197,41 @@ class SolanaScreener:
         if entry_det.get("reasons"):
             result.flag_reasons.extend(entry_det["reasons"])
 
-        # Early exit: entry sudah flag → cek network saja (murah)
-        # Jika network juga flag → 2 flags → pasti SKIP, hemat wallet analysis
+        # Entry flag = hard skip (mcap/age/liquidity di luar range = bukan target scalp)
         if entry_flag:
-            net_flag, net_det = await network.check(self.client, self.config)
-            result.network_flag = net_flag
-            result.priority_fee_microlamports = net_det.get("priority_fee_microlamports", 0)
-            result.network_details = net_det
-            if net_det.get("reasons"):
-                result.flag_reasons.extend(net_det["reasons"])
-
-            if net_flag:
-                # 2 flags (entry + network) → SKIP, skip wallet analysis
-                result.skipped_early = True
-                result.rpc_calls_used = self.client.rpc_call_count - rpc_before
-                self._record(result)
-                logger.info(
-                    f"EARLY SKIP (entry+net): {mint} "
-                    f"[{result.rpc_calls_used} RPC calls saved]"
-                )
-                return result
+            result.skipped_early = True
+            result.rpc_calls_used = self.client.rpc_call_count - rpc_before
+            self._record(result)
+            logger.info(
+                f"EARLY SKIP (entry): {mint} mcap=${result.market_cap_usd:,.0f} "
+                f"[{result.rpc_calls_used} RPC calls saved]"
+            )
+            return result
 
         # ─── PHASE 3: Full Analysis (parallel, shared data) ──────────
         # Fetch holders SEKALI, share ke wallet_analysis & holder_quality
         holders_data = await self.client.get_token_largest_accounts(mint)
         supply = await self.client.get_token_supply(mint)
 
-        # Run filter 1 + 2 + 3 in parallel (network might already be done)
-        tasks = []
-        need_network = not entry_flag  # belum dicek di phase 2
-
-        if need_network:
-            tasks.append(network.check(self.client, self.config))
-        tasks.append(
+        # Run filter 1 + 2 + 3 in parallel
+        tasks = [
+            network.check(self.client, self.config),
             wallet_analysis.check(mint, self.client, self.config,
-                                  holders_data=holders_data)
-        )
-        tasks.append(
+                                  holders_data=holders_data),
             holder_quality.check(mint, self.client, self.config,
-                                 holders_data=holders_data, supply=supply)
-        )
+                                 holders_data=holders_data, supply=supply),
+        ]
 
         results = await asyncio.gather(*tasks)
-        idx = 0
 
-        if need_network:
-            net_flag, net_det = results[idx]; idx += 1
-            result.network_flag = net_flag
-            result.priority_fee_microlamports = net_det.get("priority_fee_microlamports", 0)
-            result.network_details = net_det
-            if net_det.get("reasons"):
-                result.flag_reasons.extend(net_det["reasons"])
+        net_flag, net_det = results[0]
+        result.network_flag = net_flag
+        result.priority_fee_microlamports = net_det.get("priority_fee_microlamports", 0)
+        result.network_details = net_det
+        if net_det.get("reasons"):
+            result.flag_reasons.extend(net_det["reasons"])
 
-        wallet_flag, wallet_det = results[idx]; idx += 1
+        wallet_flag, wallet_det = results[1]
         result.wallet_flag = wallet_flag
         result.holder_count = wallet_det.get("holder_count", 0)
         result.fresh_wallet_count = wallet_det.get("fresh_wallet_count", 0)
@@ -256,7 +240,7 @@ class SolanaScreener:
         if wallet_det.get("reasons"):
             result.flag_reasons.extend(wallet_det["reasons"])
 
-        holder_flag, holder_det = results[idx]; idx += 1
+        holder_flag, holder_det = results[2]
         result.holder_flag = holder_flag
         result.top1_holder_pct = holder_det.get("top1_holder_pct", 0.0)
         result.top10_combined_pct = holder_det.get("top10_combined_pct", 0.0)

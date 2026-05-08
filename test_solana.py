@@ -328,6 +328,41 @@ def test_screener_multi_flag_skip():
     assert result.total_flags >= 2
 
 
+def test_screener_entry_flag_hard_skip():
+    """Entry flag alone → SKIP (mcap terlalu tinggi bukan target scalp)."""
+    import time
+    async def run():
+        screener = SolanaScreener(Config)
+        screener.client = _make_mock_client(
+            get_dexscreener_data_retry=AsyncMock(return_value={
+                "baseToken": {"symbol": "BIGCAP", "name": "Big Cap Token"},
+                "priceUsd": "7.0",
+                "marketCap": 7_000_000,  # $7M — jauh di atas max $80K
+                "liquidity": {"usd": 500_000},
+                "volume": {"m5": 1000, "h1": 10_000},
+                "pairCreatedAt": int(time.time() * 1000) - 60_000,
+            }),
+        )
+        result = await screener.screen("mint_bigcap")
+        await screener.close()
+        return result
+
+    result = asyncio.run(run())
+    assert result.decision == "SKIP"
+    assert result.entry_flag is True
+    assert result.skipped_early is True
+    # Should NOT run wallet analysis (RPC savings)
+    assert result.holder_count == 0
+
+
+def test_decision_entry_flag_overrides():
+    """Even with 0 other flags, entry_flag alone = SKIP."""
+    r = SolanaTokenResult(mint="x", entry_flag=True)
+    assert r.decision == "SKIP"
+    r2 = SolanaTokenResult(mint="x", entry_flag=False)
+    assert r2.decision == "GAS IT"
+
+
 # ── Telegram Format Tests ──────────────────────────────────────────────────
 
 def test_telegram_format_gas_it():
