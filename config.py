@@ -20,6 +20,8 @@ PRESETS = {
         "MIN_HOLDER_COUNT":          10,
         "MAX_FRESH_WALLET_RATIO":    0.75,  # tolerate up to 75% fresh (wajar di launch)
         "FRESH_WALLET_TX_THRESHOLD": 5,
+        "MIN_AVG_WALLET_AGE_DAYS":   30.0,  # min avg 1 bulan (fresh lebih toleran)
+        "MIN_WALLET_AGE_STD_DAYS":   15.0,  # min std 15 hari
         "MAX_TOP_HOLDER_PCT":        12.0,
         "MAX_TOP10_COMBINED_PCT":    55.0,
         "MIN_LIQUIDITY_SOL":         3.0,   # bonding curve start sekitar 3-5 SOL
@@ -35,6 +37,8 @@ PRESETS = {
         "MIN_HOLDER_COUNT":          20,
         "MAX_FRESH_WALLET_RATIO":    0.6,
         "FRESH_WALLET_TX_THRESHOLD": 10,
+        "MIN_AVG_WALLET_AGE_DAYS":   90.0,  # min avg 3 bulan (defined.fi default)
+        "MIN_WALLET_AGE_STD_DAYS":   90.0,  # min std 3 bulan
         "MAX_TOP_HOLDER_PCT":        15.0,
         "MAX_TOP10_COMBINED_PCT":    50.0,
         "MIN_LIQUIDITY_SOL":         10.0,
@@ -50,6 +54,8 @@ PRESETS = {
         "MIN_HOLDER_COUNT":          100,
         "MAX_FRESH_WALLET_RATIO":    0.4,
         "FRESH_WALLET_TX_THRESHOLD": 20,
+        "MIN_AVG_WALLET_AGE_DAYS":   180.0, # min avg 6 bulan
+        "MIN_WALLET_AGE_STD_DAYS":   120.0, # min std 4 bulan
         "MAX_TOP_HOLDER_PCT":        10.0,
         "MAX_TOP10_COMBINED_PCT":    40.0,
         "MIN_LIQUIDITY_SOL":         30.0,
@@ -109,9 +115,14 @@ class Config:
     MAX_FRESH_WALLET_RATIO: float = _env_float(
         "MAX_FRESH_WALLET_RATIO", _PRESET["MAX_FRESH_WALLET_RATIO"]
     )
-    MIN_AVG_BUYER_WALLET_AGE_DAYS: float = 3.0
     FRESH_WALLET_TX_THRESHOLD: int = _env_int(
         "FRESH_WALLET_TX_THRESHOLD", _PRESET["FRESH_WALLET_TX_THRESHOLD"]
+    )
+    MIN_AVG_WALLET_AGE_DAYS: float = _env_float(
+        "MIN_AVG_WALLET_AGE_DAYS", _PRESET["MIN_AVG_WALLET_AGE_DAYS"]
+    )
+    MIN_WALLET_AGE_STD_DAYS: float = _env_float(
+        "MIN_WALLET_AGE_STD_DAYS", _PRESET["MIN_WALLET_AGE_STD_DAYS"]
     )
 
     # ── Filter 3: Holder Quality ───────────────────────────────────────────

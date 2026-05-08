@@ -44,7 +44,7 @@ class SolanaClient:
         self._sol_price_cache: tuple[float, float] | None = None  # (price, timestamp)
         self.rpc_call_count: int = 0
         self._priority_fee_cache: tuple[int, float] | None = None  # (fee, timestamp)
-        self._wallet_age_cache: dict[str, tuple[int, float]] = {}  # addr → (tx_count, timestamp)
+        self._wallet_info_cache: dict[str, tuple[int, float, float]] = {}  # addr → (tx_count, oldest_blocktime, cache_ts)
 
     async def close(self):
         await self._http.aclose()
@@ -201,32 +201,54 @@ class SolanaClient:
             owners.append(None)
         return owners
 
-    async def get_wallet_tx_count_cached(self, wallet: str, limit: int = 20) -> int:
+    async def _fetch_wallet_info(self, wallet: str, limit: int = 20) -> tuple[int, float]:
         """
-        Ambil jumlah tx sebuah wallet, cached 10 menit.
-        Whales / market makers yang sama sering muncul di banyak token.
+        Fetch tx count + oldest blockTime dari signatures.
+        Returns (tx_count, oldest_blocktime_unix).
         """
         import time as _time
-        CACHE_TTL = 600.0  # 10 menit
+        CACHE_TTL = 600.0
 
-        if wallet in self._wallet_age_cache:
-            count, ts = self._wallet_age_cache[wallet]
-            if _time.time() - ts < CACHE_TTL:
-                return count
+        if wallet in self._wallet_info_cache:
+            count, oldest_bt, cache_ts = self._wallet_info_cache[wallet]
+            if _time.time() - cache_ts < CACHE_TTL:
+                return count, oldest_bt
 
         sigs = await self.get_signatures_for_address(wallet, limit=limit)
         count = len(sigs) if sigs else 0
-        self._wallet_age_cache[wallet] = (count, _time.time())
+        oldest_bt = 0.0
+        if sigs:
+            block_times = [s.get("blockTime") or 0 for s in sigs]
+            valid_times = [t for t in block_times if t > 0]
+            oldest_bt = min(valid_times) if valid_times else 0.0
 
-        # Prune cache kalau terlalu besar
-        if len(self._wallet_age_cache) > 5000:
+        self._wallet_info_cache[wallet] = (count, oldest_bt, _time.time())
+
+        if len(self._wallet_info_cache) > 5000:
             now = _time.time()
-            self._wallet_age_cache = {
-                k: v for k, v in self._wallet_age_cache.items()
-                if now - v[1] < CACHE_TTL
+            self._wallet_info_cache = {
+                k: v for k, v in self._wallet_info_cache.items()
+                if now - v[2] < CACHE_TTL
             }
 
+        return count, oldest_bt
+
+    async def get_wallet_tx_count_cached(self, wallet: str, limit: int = 20) -> int:
+        """Ambil jumlah tx sebuah wallet, cached 10 menit."""
+        count, _ = await self._fetch_wallet_info(wallet, limit)
         return count
+
+    async def get_wallet_age_days(self, wallet: str, limit: int = 20) -> float:
+        """
+        Estimasi umur wallet dalam hari (dari oldest blockTime di recent sigs).
+        Returns 0.0 jika tidak ada data.
+        """
+        import time as _time
+        _, oldest_bt = await self._fetch_wallet_info(wallet, limit)
+        if oldest_bt <= 0:
+            return 0.0
+        age_seconds = _time.time() - oldest_bt
+        return max(0.0, age_seconds / 86400.0)
 
     async def get_first_token_tx_slot(self, wallet: str, mint: str) -> int | None:
         """

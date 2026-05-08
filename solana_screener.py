@@ -58,6 +58,8 @@ class SolanaTokenResult:
     holder_count: int = 0
     fresh_wallet_count: int = 0
     fresh_wallet_ratio: float = 0.0
+    avg_wallet_age_days: float = 0.0
+    wallet_age_std_days: float = 0.0
     wallet_details: dict = field(default_factory=dict)
 
     # Filter 3 — Holder Quality
@@ -115,7 +117,7 @@ class SolanaTokenResult:
             f"{'='*52}",
             f"  CA: {self.mint}",
             f"  MCap: ${self.market_cap_usd:,.0f} | Liq: {self.liquidity_sol_est:.1f} SOL | Ratio: {self.mcap_liq_ratio:.1f}x",
-            f"  Holders: {self.holder_count} | Fresh: {self.fresh_wallet_count} ({self.fresh_wallet_ratio:.0%})",
+            f"  Holders: {self.holder_count} | Fresh: {self.fresh_wallet_count} ({self.fresh_wallet_ratio:.0%}) | Avg age: {self.avg_wallet_age_days:.0f}d (std {self.wallet_age_std_days:.0f}d)",
             f"  Top1: {self.top1_holder_pct:.1f}% | Top10: {self.top10_combined_pct:.1f}%",
             f"  Mint revoked: {self.mint_authority_revoked} | Freeze revoked: {self.freeze_authority_revoked}",
             f"  Priority fee: {self.priority_fee_microlamports:,} microlamports",
@@ -248,6 +250,8 @@ class SolanaScreener:
         result.holder_count = wallet_det.get("holder_count", 0)
         result.fresh_wallet_count = wallet_det.get("fresh_wallet_count", 0)
         result.fresh_wallet_ratio = wallet_det.get("fresh_wallet_ratio", 0.0)
+        result.avg_wallet_age_days = wallet_det.get("avg_wallet_age_days", 0.0)
+        result.wallet_age_std_days = wallet_det.get("wallet_age_std_days", 0.0)
         result.wallet_details = wallet_det
         if wallet_det.get("reasons"):
             result.flag_reasons.extend(wallet_det["reasons"])

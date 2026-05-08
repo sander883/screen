@@ -54,11 +54,19 @@ def _make_mock_client(**overrides):
         ]),
         "get_signatures_for_address": AsyncMock(
             side_effect=lambda addr, limit=20: [
-                {"signature": f"sig-{addr}-{i}", "slot": hash(addr) % 1_000_000 + i}
+                {"signature": f"sig-{addr}-{i}",
+                 "slot": hash(addr) % 1_000_000 + i,
+                 "blockTime": int(time.time()) - 200 * 86400 + i * 86400}  # ~200 days ago spread
                 for i in range(min(limit, 50))
             ]
         ),
-        "get_wallet_tx_count_cached": AsyncMock(return_value=50),  # 50 tx = not fresh
+        "get_wallet_tx_count_cached": AsyncMock(return_value=50),
+        "_fetch_wallet_info": AsyncMock(
+            side_effect=lambda w, limit=20: (50, time.time() - (100 + hash(w) % 300) * 86400)
+        ),
+        "get_wallet_age_days": AsyncMock(
+            side_effect=lambda w, limit=20: 100.0 + hash(w) % 300
+        ),
         "get_priority_fee": AsyncMock(return_value=50_000),
         "get_dexscreener_data_retry": AsyncMock(return_value={
             "baseToken": {"symbol": "TEST", "name": "Test Token"},
@@ -169,14 +177,17 @@ def test_wallet_analysis_too_few_holders():
 
 
 def test_wallet_analysis_many_fresh_wallets():
-    """Terlalu banyak wallet fresh → bundle flag."""
+    """Terlalu banyak wallet fresh → flag."""
+    import time
     from filters import wallet_analysis
     client = _make_mock_client(
         get_wallet_tx_count_cached=AsyncMock(return_value=2),  # hanya 2 tx = fresh
+        _fetch_wallet_info=AsyncMock(return_value=(2, time.time() - 5 * 86400)),  # 5 days old
+        get_wallet_age_days=AsyncMock(return_value=5.0),  # 5 days old
     )
     flag, details = asyncio.run(wallet_analysis.check("mint123", client, Config))
     assert flag is True
-    assert details["bundle_suspected"] is True
+    assert details["fresh_wallet_ratio"] > 0
 
 
 def test_wallet_analysis_healthy():
@@ -405,6 +416,49 @@ def test_telegram_format_skip():
     msg = _format_message(r)
     assert "SKIP" in msg
     assert "Scm777" in msg
+
+
+# ── Wallet Age Tests ──────────────────────────────────────────────────────
+
+def test_wallet_analysis_young_wallets_flag():
+    """Semua wallet umurnya < 30 hari → flag (avg too low)."""
+    import time as _time
+    from filters import wallet_analysis
+    client = _make_mock_client(
+        _fetch_wallet_info=AsyncMock(
+            side_effect=lambda w, limit=20: (50, _time.time() - 10 * 86400)  # 10 days old
+        ),
+        get_wallet_age_days=AsyncMock(return_value=10.0),
+    )
+    flag, details = asyncio.run(wallet_analysis.check("mint", client, Config))
+    assert flag is True
+    assert details["avg_wallet_age_days"] < 30
+    assert any("avg wallet age" in r.lower() for r in details["reasons"])
+
+
+def test_wallet_analysis_uniform_age_flag():
+    """Semua wallet umur persis sama → std dev 0 → flag."""
+    import time as _time
+    from filters import wallet_analysis
+    client = _make_mock_client(
+        _fetch_wallet_info=AsyncMock(
+            return_value=(50, _time.time() - 120 * 86400)  # exactly 120 days old
+        ),
+        get_wallet_age_days=AsyncMock(return_value=120.0),  # all same age
+    )
+    flag, details = asyncio.run(wallet_analysis.check("mint", client, Config))
+    assert flag is True
+    assert details["wallet_age_std_days"] < 1  # ~0
+    assert any("std dev" in r.lower() or "seragam" in r.lower() for r in details["reasons"])
+
+
+def test_wallet_analysis_diverse_old_wallets_ok():
+    """Wallet tua dengan umur bervariasi → tidak flag."""
+    from filters import wallet_analysis
+    client = _make_mock_client()  # defaults: ages 100-400 days, varied
+    flag, details = asyncio.run(wallet_analysis.check("mint", client, Config))
+    assert flag is False
+    assert details["avg_wallet_age_days"] > 30
 
 
 # ── MCap:Liq Ratio Tests ──────────────────────────────────────────────────
