@@ -52,6 +52,7 @@ async def live_mode():
         on_new_pair=screener.screen_and_notify,
         max_concurrent=3,
         rpc_url=Config.rpc_url(),
+        gmgn_api_key=Config.GMGN_API_KEY,
     )
 
     logger.info("=" * 55)

@@ -53,6 +53,7 @@ class PairDetector:
         on_new_pair: Callable[[str], Awaitable[None]],
         max_concurrent: int = 3,
         rpc_url: str = "",
+        gmgn_api_key: str = "",
     ):
         self.ws_url = ws_url
         self.rpc_url = rpc_url or (
@@ -61,20 +62,31 @@ class PairDetector:
         )
         self.pumpfun_program = pumpfun_program
         self.helius_api_key = helius_api_key
+        self.gmgn_api_key = gmgn_api_key
         self.on_new_pair = on_new_pair
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._running = False
         self._ws_429_count = 0
-        self._mode = "websocket"  # "websocket" or "polling"
+        self._mode = "websocket"  # "websocket", "polling", or "gmgn"
 
     async def start(self):
-        """Mulai listening. Auto-switch WebSocket → polling jika perlu."""
+        """
+        Mulai listening. Fallback chain:
+        1. WebSocket (real-time, <1s)
+        2. GMGN API polling (jika ada key, 0 RPC, setiap 12s)
+        3. HTTP RPC polling (fallback terakhir, setiap 10s)
+        """
         self._running = True
+        # Kalau ada GMGN key tapi tidak ada Helius WS, langsung GMGN
+        if self.gmgn_api_key and not self.helius_api_key:
+            self._mode = "gmgn"
 
         while self._running:
             try:
                 if self._mode == "websocket":
                     await self._start_websocket()
+                elif self._mode == "gmgn":
+                    await self._start_gmgn_polling()
                 else:
                     await self._start_polling()
             except asyncio.CancelledError:
@@ -107,8 +119,12 @@ class PairDetector:
                         f"WebSocket 429 ({self._ws_429_count}/{_MAX_WS_429_BEFORE_FALLBACK})"
                     )
                     if self._ws_429_count >= _MAX_WS_429_BEFORE_FALLBACK:
-                        logger.info("Switching to HTTP polling mode (WebSocket rate limited)")
-                        self._mode = "polling"
+                        if self.gmgn_api_key:
+                            logger.info("Switching to GMGN polling (WebSocket rate limited)")
+                            self._mode = "gmgn"
+                        else:
+                            logger.info("Switching to HTTP polling (WebSocket rate limited)")
+                            self._mode = "polling"
                         return
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
@@ -172,6 +188,49 @@ class PairDetector:
         _mark_screened(mint)
         logger.info(f"New pair (ws): {mint}")
         asyncio.create_task(self._screen_with_limit(mint))
+
+    # ── GMGN Polling Mode ─────────────────────────────────────────────────
+
+    async def _start_gmgn_polling(self):
+        """
+        Poll GMGN API untuk new pairs setiap 12 detik (rate limit: 1 per 5s).
+        Keuntungan: 0 RPC calls, data sudah difilter (not honeypot, renounced).
+        """
+        from gmgn_client import GmgnClient
+
+        POLL_INTERVAL = 12  # GMGN rate limit = 5s, kita beri margin
+        gmgn = GmgnClient(api_key=self.gmgn_api_key)
+
+        logger.info(f"GMGN polling mode started | interval={POLL_INTERVAL}s | 0 RPC calls")
+
+        seen_mints: set[str] = set()
+        try:
+            while self._running:
+                try:
+                    tokens = await gmgn.get_new_pairs(limit=20)
+                    for token in tokens:
+                        mint = token.get("address") or token.get("mint") or ""
+                        if not mint or mint in seen_mints:
+                            continue
+                        if _is_recently_screened(mint):
+                            seen_mints.add(mint)
+                            continue
+
+                        seen_mints.add(mint)
+                        _mark_screened(mint)
+                        logger.info(f"New pair (gmgn): {mint} ({token.get('symbol', '?')})")
+                        asyncio.create_task(self._screen_with_limit(mint))
+
+                    # Cap seen set size
+                    if len(seen_mints) > 5000:
+                        seen_mints = set(list(seen_mints)[-2000:])
+
+                except Exception as e:
+                    logger.warning(f"GMGN polling error: {e}")
+
+                await asyncio.sleep(POLL_INTERVAL)
+        finally:
+            await gmgn.close()
 
     # ── HTTP Polling Mode ─────────────────────────────────────────────────
 

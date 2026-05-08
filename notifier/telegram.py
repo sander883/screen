@@ -113,6 +113,13 @@ def _format_message(r) -> str:
         f"\n[{_status(r.bundle_flag)}] Bundle  — {bundle_str}"
     )
 
+    # GMGN supplementary info
+    gmgn_risk = getattr(r, "gmgn_rug_risk", "") or ""
+    gmgn_sm = getattr(r, "gmgn_smart_money", 0) or 0
+    if gmgn_risk or gmgn_sm:
+        sm_str = f" | 🐋 Smart money: {gmgn_sm}" if gmgn_sm else ""
+        filter_lines += f"\n<b>GMGN:</b> Risk={gmgn_risk}{sm_str}"
+
     # ── Flag count & decision ─────────────────────────────────────────────
     total = r.total_flags
     decision_line = (

@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from config import Config
 from solana_client import SolanaClient
 from pumpfun_client import PumpFunClient
+from gmgn_client import GmgnClient
 from filters import token_safety, network, wallet_analysis, holder_quality, entry_quality, bundle_detection
 from notifier.telegram import send_alert
 
@@ -47,6 +48,11 @@ class SolanaTokenResult:
     mint_authority_revoked: bool = False
     freeze_authority_revoked: bool = False
     safety_details: dict = field(default_factory=dict)
+
+    # GMGN supplementary data
+    gmgn_rug_risk: str = ""
+    gmgn_smart_money: int = 0
+    gmgn_security: dict = field(default_factory=dict)
 
     # Filter 1 — Network
     network_flag: bool = False
@@ -122,6 +128,7 @@ class SolanaTokenResult:
             f"  Mint revoked: {self.mint_authority_revoked} | Freeze revoked: {self.freeze_authority_revoked}",
             f"  Priority fee: {self.priority_fee_microlamports:,} microlamports",
             f"  Bundle: {self.max_same_slot} holders same slot | LP Burned: {self.lp_burned}",
+            f"  GMGN: risk={self.gmgn_rug_risk or 'n/a'} | smart money={self.gmgn_smart_money}",
             f"  Flags: {self.total_flags}/5  →  {self.decision}",
             f"  RPC calls: {self.rpc_calls_used}",
         ]
@@ -145,6 +152,7 @@ class SolanaScreener:
             helius_api_key=config.HELIUS_API_KEY,
         )
         self.pumpfun = PumpFunClient(self.client)
+        self.gmgn = GmgnClient(api_key=config.GMGN_API_KEY) if config.GMGN_API_KEY else None
         self._stats = {"total": 0, "gas_it": 0, "skip": 0, "rpc_total": 0}
 
     @property
@@ -153,6 +161,8 @@ class SolanaScreener:
 
     async def close(self):
         await self.client.close()
+        if self.gmgn:
+            await self.gmgn.close()
 
     async def screen(self, mint: str) -> SolanaTokenResult:
         """
@@ -181,11 +191,29 @@ class SolanaScreener:
             logger.info(f"AUTO SKIP (safety): {mint} [{result.rpc_calls_used} RPC calls]")
             return result
 
-        # ─── PHASE 2: DexScreener + Entry Quality (0 RPC calls) ──────
-        dex_data = await self.client.get_dexscreener_data_retry(mint, retries=3, delay=8.0)
+        # ─── PHASE 2: DexScreener + GMGN (parallel, 0 RPC calls) ────
+        # Fetch market data + GMGN security in parallel (both HTTP, free)
+        dex_task = self.client.get_dexscreener_data_retry(mint, retries=3, delay=8.0)
+        gmgn_task = self.gmgn.get_token_security(mint) if self.gmgn else asyncio.sleep(0)
+        dex_data, gmgn_sec = await asyncio.gather(dex_task, gmgn_task)
+        if not isinstance(gmgn_sec, dict):
+            gmgn_sec = {}
+
+        # Store GMGN data
+        if gmgn_sec:
+            result.gmgn_security = gmgn_sec
+            result.gmgn_rug_risk = gmgn_sec.get("rug_risk", "")
+            result.gmgn_smart_money = gmgn_sec.get("smart_money_count", 0)
+            # GMGN honeypot = auto skip
+            if gmgn_sec.get("is_honeypot"):
+                result.safety_flag = True
+                result.flag_reasons.append("GMGN: honeypot detected")
+                result.rpc_calls_used = self.client.rpc_call_count - rpc_before
+                self._record(result)
+                logger.info(f"AUTO SKIP (GMGN honeypot): {mint}")
+                return result
 
         # Fallback ke Pump.fun on-chain bonding curve kalau DexScreener kosong
-        # (token pre-graduation belum terindeks di DexScreener)
         if not dex_data:
             sol_price = await self.client.get_sol_price_usd()
             dex_data = await self.pumpfun.get_market_data(mint, sol_price)
