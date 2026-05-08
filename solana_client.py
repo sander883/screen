@@ -228,6 +228,20 @@ class SolanaClient:
 
         return count
 
+    async def get_first_token_tx_slot(self, wallet: str, mint: str) -> int | None:
+        """
+        Cari slot transaksi pertama wallet ini yang terlibat dengan token mint.
+        Pakai getSignaturesForAddress dengan before= untuk cari oldest.
+        Returns slot number, atau None jika tidak ditemukan.
+        """
+        sigs = await self._rpc(
+            "getSignaturesForAddress",
+            [wallet, {"limit": 1, "commitment": "confirmed"}],
+        )
+        if not sigs:
+            return None
+        return sigs[0].get("slot")
+
     # ── Helius Enhanced Transactions ───────────────────────────────────────
 
     async def get_parsed_transactions(self, signatures: list[str]) -> list[dict]:

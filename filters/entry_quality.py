@@ -69,7 +69,12 @@ async def check(
         max_age = getattr(config, "MAX_PAIR_AGE_SECONDS", 0)
         pair_too_old = bool(max_age) and pair_age_sec > max_age
 
-        flag = mcap_too_low or mcap_too_high or liq_too_low or pair_too_old
+        # MCap:Liq ratio — kalau mcap jauh lebih besar dari liquidity = inflated / mudah rug
+        max_ratio = getattr(config, "MAX_MCAP_LIQ_RATIO", 2.0)
+        mcap_liq_ratio = market_cap / liq_usd if liq_usd > 0 else 999.0
+        ratio_too_high = mcap_liq_ratio > max_ratio
+
+        flag = mcap_too_low or mcap_too_high or liq_too_low or pair_too_old or ratio_too_high
 
         reasons = []
         if mcap_too_low:
@@ -82,6 +87,10 @@ async def check(
             reasons.append(
                 f"Pair terlalu lama: {int(pair_age_sec/60)}m (max {int(max_age/60)}m) — bukan fresh"
             )
+        if ratio_too_high:
+            reasons.append(
+                f"MCap:Liq ratio {mcap_liq_ratio:.1f}x (max {max_ratio:.1f}x) — mcap inflated"
+            )
 
         # Tentukan mcap tier untuk context
         tier = _get_mcap_tier(market_cap)
@@ -91,6 +100,7 @@ async def check(
             "market_cap_usd": round(market_cap, 2),
             "liquidity_usd": round(liq_usd, 2),
             "liquidity_sol_est": round(liq_sol, 2),
+            "mcap_liq_ratio": round(mcap_liq_ratio, 2),
             "volume_5m_usd": round(vol_5m, 2),
             "volume_1h_usd": round(vol_1h, 2),
             "pair_age_seconds": round(pair_age_sec, 0),

@@ -27,6 +27,8 @@ PRESETS = {
         "MAX_MARKET_CAP_USD":        150_000.0,  # $150K (fokus fresh)
         "MAX_PAIR_AGE_SECONDS":      1800,  # max 30 menit umur pair
         "MAX_PRIORITY_FEE_MICROLAMPORTS": 500_000,
+        "MAX_MCAP_LIQ_RATIO":       2.5,   # mcap/liq max 2.5x (fresh lebih toleran)
+        "MAX_BUNDLE_SAME_SLOT":      3,     # max 3 top holder beli di slot yg sama
     },
     "standard": {
         # Sweet spot scalp — setting default sebelumnya
@@ -40,6 +42,8 @@ PRESETS = {
         "MAX_MARKET_CAP_USD":        500_000.0,
         "MAX_PAIR_AGE_SECONDS":      7200,  # max 2 jam
         "MAX_PRIORITY_FEE_MICROLAMPORTS": 500_000,
+        "MAX_MCAP_LIQ_RATIO":       2.0,   # mcap/liq max 2x
+        "MAX_BUNDLE_SAME_SLOT":      3,
     },
     "safe": {
         # Stricter — token yang sudah lebih matang
@@ -53,6 +57,8 @@ PRESETS = {
         "MAX_MARKET_CAP_USD":        1_000_000.0,
         "MAX_PAIR_AGE_SECONDS":      86400,  # max 24 jam
         "MAX_PRIORITY_FEE_MICROLAMPORTS": 500_000,
+        "MAX_MCAP_LIQ_RATIO":       1.5,   # mcap/liq max 1.5x (stricter)
+        "MAX_BUNDLE_SAME_SLOT":      2,
     },
 }
 
@@ -128,6 +134,14 @@ class Config:
     )
     MAX_PAIR_AGE_SECONDS: int = _env_int(
         "MAX_PAIR_AGE_SECONDS", _PRESET["MAX_PAIR_AGE_SECONDS"]
+    )
+    MAX_MCAP_LIQ_RATIO: float = _env_float(
+        "MAX_MCAP_LIQ_RATIO", _PRESET["MAX_MCAP_LIQ_RATIO"]
+    )
+
+    # ── Filter 5: Bundle Detection ─────────────────────────────────────────
+    MAX_BUNDLE_SAME_SLOT: int = _env_int(
+        "MAX_BUNDLE_SAME_SLOT", _PRESET["MAX_BUNDLE_SAME_SLOT"]
     )
 
     # ── RPC / API URLs ─────────────────────────────────────────────────────

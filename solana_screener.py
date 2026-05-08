@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from config import Config
 from solana_client import SolanaClient
 from pumpfun_client import PumpFunClient
-from filters import token_safety, network, wallet_analysis, holder_quality, entry_quality
+from filters import token_safety, network, wallet_analysis, holder_quality, entry_quality, bundle_detection
 from notifier.telegram import send_alert
 
 logger = logging.getLogger(__name__)
@@ -72,10 +72,16 @@ class SolanaTokenResult:
     market_cap_usd: float = 0.0
     liquidity_usd: float = 0.0
     liquidity_sol_est: float = 0.0
+    mcap_liq_ratio: float = 0.0
     volume_5m_usd: float = 0.0
     mcap_tier: str = ""
     dex_pair_url: str = ""
     entry_details: dict = field(default_factory=dict)
+
+    # Filter 5 — Bundle Detection
+    bundle_flag: bool = False
+    max_same_slot: int = 0
+    bundle_details: dict = field(default_factory=dict)
 
     # Agregasi
     flag_reasons: list[str] = field(default_factory=list)
@@ -84,13 +90,16 @@ class SolanaTokenResult:
 
     @property
     def total_flags(self) -> int:
-        return sum([self.network_flag, self.wallet_flag, self.holder_flag, self.entry_flag])
+        return sum([self.network_flag, self.wallet_flag, self.holder_flag,
+                    self.entry_flag, self.bundle_flag])
 
     @property
     def decision(self) -> str:
         if self.safety_flag:
             return "SKIP"
         if self.entry_flag:
+            return "SKIP"
+        if self.bundle_flag:
             return "SKIP"
         return "SKIP" if self.total_flags >= 2 else "GAS IT"
 
@@ -105,13 +114,13 @@ class SolanaTokenResult:
             f"  {self.decision} — ${self.symbol} ({self.name[:20]})",
             f"{'='*52}",
             f"  CA: {self.mint}",
-            f"  MCap: ${self.market_cap_usd:,.0f} | Liq: {self.liquidity_sol_est:.1f} SOL",
+            f"  MCap: ${self.market_cap_usd:,.0f} | Liq: {self.liquidity_sol_est:.1f} SOL | Ratio: {self.mcap_liq_ratio:.1f}x",
             f"  Holders: {self.holder_count} | Fresh: {self.fresh_wallet_count} ({self.fresh_wallet_ratio:.0%})",
             f"  Top1: {self.top1_holder_pct:.1f}% | Top10: {self.top10_combined_pct:.1f}%",
             f"  Mint revoked: {self.mint_authority_revoked} | Freeze revoked: {self.freeze_authority_revoked}",
             f"  Priority fee: {self.priority_fee_microlamports:,} microlamports",
-            f"  LP Burned: {self.lp_burned}",
-            f"  Flags: {self.total_flags}/4  →  {self.decision}",
+            f"  Bundle: {self.max_same_slot} holders same slot | LP Burned: {self.lp_burned}",
+            f"  Flags: {self.total_flags}/5  →  {self.decision}",
             f"  RPC calls: {self.rpc_calls_used}",
         ]
         if self.flag_reasons:
@@ -191,6 +200,7 @@ class SolanaScreener:
         result.liquidity_usd = entry_det.get("liquidity_usd", 0.0)
         result.liquidity_sol_est = entry_det.get("liquidity_sol_est", 0.0)
         result.volume_5m_usd = entry_det.get("volume_5m_usd", 0.0)
+        result.mcap_liq_ratio = entry_det.get("mcap_liq_ratio", 0.0)
         result.mcap_tier = entry_det.get("mcap_tier", "")
         result.dex_pair_url = entry_det.get("dex_pair_url", "")
         result.entry_details = entry_det
@@ -213,13 +223,15 @@ class SolanaScreener:
         holders_data = await self.client.get_token_largest_accounts(mint)
         supply = await self.client.get_token_supply(mint)
 
-        # Run filter 1 + 2 + 3 in parallel
+        # Run filter 1 + 2 + 3 + 5 in parallel
         tasks = [
             network.check(self.client, self.config),
             wallet_analysis.check(mint, self.client, self.config,
                                   holders_data=holders_data),
             holder_quality.check(mint, self.client, self.config,
                                  holders_data=holders_data, supply=supply),
+            bundle_detection.check(mint, self.client, self.config,
+                                   holders_data=holders_data),
         ]
 
         results = await asyncio.gather(*tasks)
@@ -248,6 +260,13 @@ class SolanaScreener:
         result.holder_details = holder_det
         if holder_det.get("reasons"):
             result.flag_reasons.extend(holder_det["reasons"])
+
+        bundle_flag_, bundle_det = results[3]
+        result.bundle_flag = bundle_flag_
+        result.max_same_slot = bundle_det.get("max_same_slot", 0)
+        result.bundle_details = bundle_det
+        if bundle_det.get("reasons"):
+            result.flag_reasons.extend(bundle_det["reasons"])
 
         # ─── Done ─────────────────────────────────────────────────────
         result.rpc_calls_used = self.client.rpc_call_count - rpc_before

@@ -52,16 +52,19 @@ def _make_mock_client(**overrides):
         "get_multiple_token_account_owners": AsyncMock(return_value=[
             f"owner{i}" for i in range(15)
         ]),
-        "get_signatures_for_address": AsyncMock(return_value=[
-            {"signature": f"sig{i}"} for i in range(50)  # 50 tx = not fresh
-        ]),
+        "get_signatures_for_address": AsyncMock(
+            side_effect=lambda addr, limit=20: [
+                {"signature": f"sig-{addr}-{i}", "slot": hash(addr) % 1_000_000 + i}
+                for i in range(min(limit, 50))
+            ]
+        ),
         "get_wallet_tx_count_cached": AsyncMock(return_value=50),  # 50 tx = not fresh
         "get_priority_fee": AsyncMock(return_value=50_000),
         "get_dexscreener_data_retry": AsyncMock(return_value={
             "baseToken": {"symbol": "TEST", "name": "Test Token"},
             "priceUsd": "0.0005",
-            "marketCap": 100_000,
-            "liquidity": {"usd": 15_000},
+            "marketCap": 50_000,
+            "liquidity": {"usd": 30_000},
             "volume": {"m5": 500, "h1": 5000},
             "pairCreatedAt": pair_created_ms,
         }),
@@ -263,8 +266,8 @@ def test_entry_quality_sweet_spot():
     dex_data = {
         "baseToken": {"symbol": "TEST"},
         "priceUsd": "0.001",
-        "marketCap": 100_000,
-        "liquidity": {"usd": 5_000},  # ~33 SOL
+        "marketCap": 50_000,
+        "liquidity": {"usd": 30_000},  # ~200 SOL, ratio 1.67x
         "volume": {"m5": 1000, "h1": 10000},
     }
     client = _make_mock_client()
@@ -402,6 +405,103 @@ def test_telegram_format_skip():
     msg = _format_message(r)
     assert "SKIP" in msg
     assert "Scm777" in msg
+
+
+# ── MCap:Liq Ratio Tests ──────────────────────────────────────────────────
+
+def test_entry_quality_ratio_flag():
+    """MCap:Liq ratio terlalu tinggi → flag."""
+    from filters import entry_quality
+    dex_data = {
+        "baseToken": {"symbol": "INFLATED"},
+        "priceUsd": "0.01",
+        "marketCap": 100_000,
+        "liquidity": {"usd": 5_000},  # ratio = 20x, way above 2.5x
+        "volume": {"m5": 100, "h1": 500},
+    }
+    client = _make_mock_client()
+    flag, details = asyncio.run(entry_quality.check("m", client, Config, dex_data))
+    assert flag is True
+    assert details["mcap_liq_ratio"] == 20.0
+    assert any("ratio" in r.lower() or "inflated" in r.lower() for r in details["reasons"])
+
+
+def test_entry_quality_ratio_ok():
+    """MCap:Liq ratio 1.5x → ok."""
+    from filters import entry_quality
+    dex_data = {
+        "baseToken": {"symbol": "HEALTHY"},
+        "priceUsd": "0.001",
+        "marketCap": 45_000,
+        "liquidity": {"usd": 30_000},  # ratio = 1.5x
+        "volume": {"m5": 500, "h1": 3000},
+    }
+    client = _make_mock_client()
+    flag, details = asyncio.run(entry_quality.check("m", client, Config, dex_data))
+    assert flag is False
+    assert details["mcap_liq_ratio"] == 1.5
+
+
+# ── Bundle Detection Tests ────────────────────────────────────────────────
+
+def test_bundle_detection_clean():
+    """Semua holder beli di slot berbeda → no bundle flag."""
+    from filters import bundle_detection
+    client = _make_mock_client()
+    holders = [
+        {"address": f"acc{i}", "amount": str(100_000 - i*1000)}
+        for i in range(10)
+    ]
+    flag, details = asyncio.run(bundle_detection.check("mint", client, Config, holders))
+    assert flag is False
+    assert details.get("bundle_detected") is False
+
+
+def test_bundle_detection_flagged():
+    """Multiple holders di slot yang sama → bundle flag."""
+    from filters import bundle_detection
+    same_slot = 999_999
+    client = _make_mock_client(
+        get_signatures_for_address=AsyncMock(return_value=[
+            {"signature": "bundled_sig", "slot": same_slot}
+        ]),
+    )
+    holders = [
+        {"address": f"acc{i}", "amount": str(100_000 - i*1000)}
+        for i in range(5)
+    ]
+    flag, details = asyncio.run(bundle_detection.check("mint", client, Config, holders))
+    assert flag is True
+    assert details["max_same_slot"] == 5
+    assert details["bundle_detected"] is True
+    assert any("bundle" in r.lower() for r in details["reasons"])
+
+
+def test_bundle_detection_below_threshold():
+    """2 holders same slot (threshold=3) → no flag."""
+    from filters import bundle_detection
+    call_count = [0]
+    def _side_effect(addr, limit=20):
+        call_count[0] += 1
+        # First 2 calls return same slot, rest different
+        slot = 100 if call_count[0] <= 2 else call_count[0] * 1000
+        return [{"signature": f"sig{call_count[0]}", "slot": slot}]
+    client = _make_mock_client(
+        get_signatures_for_address=AsyncMock(side_effect=_side_effect),
+    )
+    holders = [
+        {"address": f"acc{i}", "amount": str(100_000 - i*1000)}
+        for i in range(5)
+    ]
+    flag, details = asyncio.run(bundle_detection.check("mint", client, Config, holders))
+    assert flag is False
+    assert details["max_same_slot"] == 2
+
+
+def test_screener_bundle_causes_skip():
+    """Bundle detected → auto SKIP."""
+    r = SolanaTokenResult(mint="x", bundle_flag=True)
+    assert r.decision == "SKIP"
 
 
 # ── Pump.fun Client Tests ──────────────────────────────────────────────────

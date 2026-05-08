@@ -97,6 +97,9 @@ def _format_message(r) -> str:
         f"Freeze {'Revoked' if r.freeze_authority_revoked else '<b>AKTIF</b>'}"
     )
 
+    ratio_str = f" | Ratio: {r.mcap_liq_ratio:.1f}x" if r.mcap_liq_ratio else ""
+    bundle_str = f"{r.max_same_slot} holders same slot" if r.max_same_slot else "clean"
+
     filter_lines = (
         f"\n\n<b>━ Filters ━</b>"
         f"\n[{_status(r.safety_flag)}] Safety  — {safety_detail}"
@@ -105,13 +108,14 @@ def _format_message(r) -> str:
         f"Fresh: {r.fresh_wallet_count} ({r.fresh_wallet_ratio:.0%})"
         f"\n[{_status(r.holder_flag)}] Holders — Top1: {r.top1_holder_pct:.1f}% | "
         f"Top10: {r.top10_combined_pct:.1f}%"
-        f"\n[{_status(r.entry_flag)}] Entry   — {r.mcap_tier}"
+        f"\n[{_status(r.entry_flag)}] Entry   — {r.mcap_tier}{ratio_str}"
+        f"\n[{_status(r.bundle_flag)}] Bundle  — {bundle_str}"
     )
 
     # ── Flag count & decision ─────────────────────────────────────────────
     total = r.total_flags
     decision_line = (
-        f"\n\n<b>Flags: {total}/4</b>  →  "
+        f"\n\n<b>Flags: {total}/5</b>  →  "
         + ("<b>GAS IT! Potensi scalp 60-70%</b>" if is_gas else "<b>SKIP. Terlalu berisiko.</b>")
     )
 
